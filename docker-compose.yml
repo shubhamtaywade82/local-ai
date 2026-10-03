@@ -10,6 +10,10 @@ services:
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
     volumes:
       - open-webui-data:/app/backend/data
+      - ./openui-tool:/app/backend/openui-tool:ro
+      - ./scripts:/app/backend/custom-scripts:ro
+    command: >
+      bash -c "(until curl -sf http://localhost:8080/health > /dev/null 2>&1; do sleep 1; done && python3 /app/backend/custom-scripts/provision-openui.py) & exec bash start.sh"
     extra_hosts:
       # Map host gateway so container can reach native Ollama on host
       - "host.docker.internal:host-gateway"
