@@ -6,6 +6,7 @@ import time
 
 DB_PATH = '/app/backend/data/webui.db'
 TOOL_CODE_PATH = '/app/backend/openui-tool/openui.py'
+TOOL_SPECS_PATH = '/app/backend/openui-tool/specs.json'
 LOCALE_DIR = '/app/build/_app/immutable/chunks'
 
 
@@ -16,6 +17,11 @@ def sync_database_records():
 
     with open(TOOL_CODE_PATH, 'r') as file_obj:
         tool_code = file_obj.read()
+
+    tool_specs = '[]'
+    if os.path.exists(TOOL_SPECS_PATH):
+        with open(TOOL_SPECS_PATH, 'r') as file_obj:
+            tool_specs = file_obj.read()
 
     now = int(time.time())
     valves = json.dumps({'cdn_base_url': 'http://localhost:8081'})
@@ -33,7 +39,7 @@ def sync_database_records():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM tool WHERE id = ?), ?))
     """, (
         'openui', admin_id, 'OpenUI - Generative UI', tool_code,
-        '[{"name": "render_openui"}]', meta, valves, now, 'openui', now
+        tool_specs, meta, valves, now, 'openui', now
     ))
 
     # Apply OpenUI tool attachment to all models by default
