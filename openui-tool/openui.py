@@ -4,6 +4,8 @@ author: thesysdev/vishxrad
 version: 0.5.0
 description: Renders interactive generative UI components (charts, forms, tables, cards, follow-ups) in chat using OpenUI Lang.
 """
+from __future__ import annotations
+
 import json
 import re
 import secrets
@@ -218,28 +220,117 @@ def _json_for_script(value: str) -> str:
     )
 
 
+def _clean_syntax_typos(line: str) -> str:
+    # Small models emit Python None, inverted bracket pairs, or single-arg Col calls
+    line = re.sub(r"\bNone\b", "null", line)
+    line = re.sub(r"\]\s*[\}\)]$", "])", line)
+    line = re.sub(r"\)\s*\]$", "])", line)
+    line = re.sub(r"Action\(\[\s*@(\w+)\(([^)]*)\)\s*\)(?!\s*\])", r"Action([@\1(\2)])", line)
+    line = re.sub(r"Col\(\s*([\"'][^\"']+[\"'])\s*\)", r"Col(\1, [])", line)
+    line = re.sub(r'(=\s*Card\(\s*\[.*\])\s*,\s*["\'][^"\']*["\']\s*\)', r"\1)", line)
+    line = re.sub(r'(=\s*Table\(\s*\[.*\])\s*,.*?\)', r"\1)", line)
+    line = re.sub(r',\s*(["\'](?:primary|secondary|tertiary)["\'])\s*,\s*(["\'](?:small|default|large)["\'])\s*\)', r', \1, "normal", \2)', line)
+    if line.endswith("}") and "{" not in line:
+        line = line[:-1] + ("])" if "[" in line else ")")
+    return line
+
+
+def _convert_card_call(line: str):
+    # OpenUI Card only accepts component arrays; decompose hallucinated Card props into CardHeader
+    m_call = re.match(
+        r"^([a-zA-Z_]\w*)\s*=\s*Card\(\s*(?:title:\s*)?([\"'].*?[\"'])\s*,\s*(?:featuresList|children|items):\s*\[(.*?)\]\s*\)$",
+        line,
+    )
+    if m_call:
+        var_name, title, children = m_call.group(1), m_call.group(2), m_call.group(3)
+        return [f"{var_name}_hdr = CardHeader({title})", f"{var_name} = Card([{var_name}_hdr, {children}])"]
+
+    m_props = re.match(
+        r"^([a-zA-Z_]\w*)\s*=\s*Card\(\s*\[\s*(?:title:\s*)?([\"'].*?[\"'])(?:,\s*(?:subtitle:\s*)?([\"'].*?[\"']))?(.*?)\s*\]\s*\)$",
+        line,
+    )
+    if m_props and ("title:" in line or "subtitle:" in line):
+        var_name, title, subtitle, rest = m_props.group(1), m_props.group(2), m_props.group(3), m_props.group(4) or ""
+        hdr_args = f"{title}, {subtitle}" if subtitle else title
+        lines = [f"{var_name}_hdr = CardHeader({hdr_args})"]
+        child_vars = [f"{var_name}_hdr"]
+        for btn in re.finditer(r"(?:[a-zA-Z_]\w*:\s*)?(Button\(.*?\))", rest):
+            btn_call = re.sub(r"action\s*[:=]\s*null", "null", btn.group(1).replace(", )", ")").strip())
+            lines.append(f"{var_name}_btn = {btn_call}")
+            child_vars.append(f"{var_name}_btn")
+        lines.append(f"{var_name} = Card([{', '.join(child_vars)}])")
+        return lines
+
+    return [line]
+
+
+def _strip_named_arguments(line: str) -> str:
+    # OpenUI syntax is positional; strip key: or key= while preserving JSON maps in {}
+    dicts = []
+
+    def save_dict(m):
+        dicts.append(m.group(0))
+        return f"__DICT_{len(dicts)-1}__"
+
+    masked = re.sub(r"\{[^{}]*\}", save_dict, line)
+    cleaned = re.sub(
+        r"([,(]\s*)[a-zA-Z_]\w*\s*[:=]\s*(?=[\[\"'\d]|true|false|null|[A-Z]\w*\(|[a-z_]\w*|__DICT_)",
+        r"\1",
+        masked,
+    )
+    for idx, d in enumerate(dicts):
+        cleaned = cleaned.replace(f"__DICT_{idx}__", d)
+    open_p, close_p = cleaned.count("("), cleaned.count(")")
+    return cleaned + (")" * (open_p - close_p)) if open_p > close_p else cleaned
+
+
+def _repair_table_rows(code: str) -> str:
+    # Small models hallucinate row-oriented tables Table([Col(...)], data); convert to column arrays
+    m_table = re.search(r"([a-zA-Z_]\w*)\s*=\s*Table\(\s*\[(.*?)\](?:\s*,\s*([a-zA-Z_]\w*))?\s*\)", code)
+    if not m_table:
+        return code
+
+    tbl_name, cols_chunk, row_var = m_table.group(1), m_table.group(2), m_table.group(3)
+    rows_data = []
+    if row_var:
+        m_rows = re.search(rf"{row_var}\s*=\s*\[(.*?)\]\s*(?=\n[a-zA-Z_]|\Z)", code, re.DOTALL)
+        if m_rows:
+            for r_match in re.finditer(r"Row\s*\((.*?)\)(?:\s*,|\s*$)", m_rows.group(1), re.MULTILINE):
+                strs = re.findall(r"[\"']([^\"']*)[\"']", r_match.group(1))
+                if strs:
+                    rows_data.append(strs)
+            code = code[:m_rows.start()] + code[m_rows.end():]
+
+    col_labels = re.findall(r"Col\(\s*[\"']([^\"']+)[\"']", cols_chunk)
+    if not col_labels:
+        return code
+
+    new_cols, col_defs, num_cols = [], [], len(col_labels)
+    for c_idx, label in enumerate(col_labels):
+        col_var = f"{tbl_name}_col{c_idx}"
+        target_pos = 0 if c_idx == 0 else (-1 if c_idx == num_cols - 1 else c_idx)
+        vals = [r[target_pos] for r in rows_data if abs(target_pos) <= len(r)] if rows_data else []
+        col_defs.append(f"{col_var} = {json.dumps(vals)}")
+        new_cols.append(f"Col({json.dumps(label)}, {col_var})")
+
+    new_table_line = f"{tbl_name} = Table([{', '.join(new_cols)}])\n" + "\n".join(col_defs)
+    return code[:m_table.start()] + new_table_line + code[m_table.end():]
+
+
 def _clean_openui_code(code: str) -> str:
-    """Sanitizes small LLM formatting slips in OpenUI Lang syntax."""
+    """Sanitizes small LLM formatting slips into valid OpenUI Lang syntax."""
     if not code:
         return code
+    code = _repair_table_rows(code)
     cleaned_lines = []
-    for line in code.splitlines():
-        trimmed = line.strip()
-        # Repair unclosed action step brackets: Action([@ToAssistant(...)) -> Action([@ToAssistant(...)])
-        line = re.sub(
-            r"Action\(\[\s*@(\w+)\(([^)]*)\)\s*\)(?!\s*\])",
-            r"Action([@\1(\2)])",
-            line,
-        )
-        # Strip keyword arguments in component calls: Callout(variant="info") -> Callout("info")
-        # Prevents OpenUI parser errors from named parameters outside dictionaries
-        if not (trimmed.startswith("{") or trimmed.endswith("}")) and "(" in line:
-            line = re.sub(
-                r'([,(]\s*)[a-zA-Z_]\w*\s*=\s*(?=["\'\d\[]|true|false|null|[a-zA-Z_]\w*)',
-                r"\1",
-                line,
-            )
-        cleaned_lines.append(line)
+    for raw in code.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "//")):
+            cleaned_lines.append(raw)
+            continue
+        line = _clean_syntax_typos(line)
+        for exp_line in _convert_card_call(line):
+            cleaned_lines.append(_strip_named_arguments(exp_line))
     return "\n".join(cleaned_lines)
 
 
@@ -435,7 +526,21 @@ body {{ padding: 4px; overflow: visible; }}
         isStreaming: false,
         onAction: handleAction,
         onError: function(err) {{
-          renderError('Failed to render OpenUI', err && err.message ? err.message : String(err));
+          if (!err) return;
+          if (Array.isArray(err)) {{
+            if (err.length === 0) return;
+            var msgs = err.map(function(e) {{
+              var m = (e && e.message) || String(e);
+              if (e && e.hint) m += ' (Hint: ' + e.hint + ')';
+              return m;
+            }}).filter(Boolean);
+            if (msgs.length === 0) return;
+            renderError('Failed to render OpenUI', msgs.join('\\n'));
+            return;
+          }}
+          var msg = (err && err.message) || String(err);
+          if (err && err.hint) msg += ' (Hint: ' + err.hint + ')';
+          renderError('Failed to render OpenUI', msg);
           console.error('OpenUI render error:', err);
         }},
         onParseResult: function(res) {{
@@ -448,7 +553,8 @@ body {{ padding: 4px; overflow: visible; }}
       setTimeout(reportHeight, 500);
       setTimeout(reportHeight, 2000);
     }} catch(err) {{
-      renderError('Failed to render OpenUI', err.message || String(err));
+      var msg = (err && err.message) || (Array.isArray(err) ? err.map(function(e){{ return (e && e.message) || String(e); }}).join('\\n') : String(err));
+      renderError('Failed to render OpenUI', msg);
       console.error('OpenUI render error:', err);
     }}
   }};
@@ -580,6 +686,11 @@ class Tools:
         btns = Buttons([Button("Submit", Action([@ToAssistant("Submit")]), "primary")])
         ## Rules
         - root = Card(...) MUST be the FIRST line.
+        - Arguments are STRICTLY POSITIONAL. NEVER write param: value or param=value outside dictionary objects. E.g. write LineChart(labels, series, "linear") NOT LineChart(labels: labels, series: series).
+        - Use null, NEVER Python None.
+        - Card([child1, child2]) ONLY accepts a list of child variables. NEVER write Card(title: ...). For titles/subtitles, use CardHeader("Title", "Subtitle").
+        - Table is strictly COLUMN-oriented: Table([Col("Col1", list1), Col("Col2", list2)]). NEVER use Row(...) or pass row data as a 2nd Table argument.
+        - For feature highlights/grids, use ListBlock([ListItem("Title", "Subtitle"), ...]) or Table([Col("Feature", list1), Col("Description", list2)]).
         - Every name must be defined and reachable from root.
         - Card is the only layout container. Do NOT use Stack.
         - Use FollowUpBlock at the END for next actions.
