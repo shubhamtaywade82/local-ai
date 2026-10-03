@@ -1,0 +1,9 @@
+# Secrets and environment configs
+.env
+
+# Logs and runtime artifacts
+*.log
+.DS_Store
+
+# Persistent volume backup snapshots
+backups/
