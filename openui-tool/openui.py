@@ -5,6 +5,7 @@ version: 0.5.0
 description: Renders interactive generative UI components (charts, forms, tables, cards, follow-ups) in chat using OpenUI Lang.
 """
 import json
+import re
 import secrets
 from html import escape
 from pydantic import BaseModel, Field
@@ -217,6 +218,31 @@ def _json_for_script(value: str) -> str:
     )
 
 
+def _clean_openui_code(code: str) -> str:
+    """Sanitizes small LLM formatting slips in OpenUI Lang syntax."""
+    if not code:
+        return code
+    cleaned_lines = []
+    for line in code.splitlines():
+        trimmed = line.strip()
+        # Repair unclosed action step brackets: Action([@ToAssistant(...)) -> Action([@ToAssistant(...)])
+        line = re.sub(
+            r"Action\(\[\s*@(\w+)\(([^)]*)\)\s*\)(?!\s*\])",
+            r"Action([@\1(\2)])",
+            line,
+        )
+        # Strip keyword arguments in component calls: Callout(variant="info") -> Callout("info")
+        # Prevents OpenUI parser errors from named parameters outside dictionaries
+        if not (trimmed.startswith("{") or trimmed.endswith("}")) and "(" in line:
+            line = re.sub(
+                r'([,(]\s*)[a-zA-Z_]\w*\s*=\s*(?=["\'\d\[]|true|false|null|[a-zA-Z_]\w*)',
+                r"\1",
+                line,
+            )
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
 def _normalize_cdn_base(cdn_base: str) -> str:
     parsed = urlparse(str(cdn_base or "").strip())
     if parsed.scheme != "https" and not (
@@ -320,7 +346,7 @@ def _build_openui_html(
     safe_cdn_base = _normalize_cdn_base(cdn_base)
     safe_cdn_attr = escape(safe_cdn_base, quote=True)
     cdn_json = _json_for_script(safe_cdn_base)
-    cdn_csp_source = _csp_source_for(safe_cdn_base)
+    cdn_csp_source = f"{_csp_source_for(safe_cdn_base)} https://cdn.jsdelivr.net"
     code_json = _json_for_script(code)
     theme_script = _THEME_SCRIPT.replace("<script>", f'<script nonce="{nonce}">')
     body_scripts = _BODY_SCRIPTS.replace("<script>", f'<script nonce="{nonce}">')
@@ -407,7 +433,17 @@ body {{ padding: 4px; overflow: visible; }}
         response: code,
         library: OpenUI.openuiChatLibrary,
         isStreaming: false,
-        onAction: handleAction
+        onAction: handleAction,
+        onError: function(err) {{
+          renderError('Failed to render OpenUI', err && err.message ? err.message : String(err));
+          console.error('OpenUI render error:', err);
+        }},
+        onParseResult: function(res) {{
+          if (res && res.errors && res.errors.length > 0 && !res.root) {{
+            var msg = res.errors.map(function(e) {{ return e.message || String(e); }}).join('\\n');
+            renderError('OpenUI Syntax Error', msg);
+          }}
+        }}
       }}));
       setTimeout(reportHeight, 500);
       setTimeout(reportHeight, 2000);
@@ -440,8 +476,8 @@ class Tools:
     """
     class Valves(BaseModel):
         cdn_base_url: str = Field(
-            default=_CDN_BASE,
-            description="Base CDN URL for the OpenUI bundle. Change if self-hosting or using a different version.",
+            default="http://localhost:8081",
+            description="Base CDN URL for the OpenUI bundle. Defaults to local container bundle on port 8081.",
         )
     def __init__(self):
         self.valves = self.Valves()
@@ -563,6 +599,7 @@ class Tools:
                     },
                 }
             )
+        openui_lang_code = _clean_openui_code(openui_lang_code)
         theme = await _get_openwebui_theme(__event_call__)
         response = HTMLResponse(
             content=_build_openui_html(openui_lang_code, title, self.valves.cdn_base_url, theme),
