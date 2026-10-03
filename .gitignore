@@ -7,3 +7,4 @@
 
 # Persistent volume backup snapshots
 backups/
+openui-tool/__pycache__/*.pyc

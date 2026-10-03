@@ -11,7 +11,6 @@ import re
 import secrets
 from html import escape
 from pydantic import BaseModel, Field
-from starlette.responses import HTMLResponse
 from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 # Theme detection script - runs in <head> before content renders so CSS
@@ -224,12 +223,16 @@ def _clean_syntax_typos(line: str) -> str:
     # Small models emit Python None, inverted bracket pairs, or single-arg Col calls
     line = re.sub(r"\bNone\b", "null", line)
     line = re.sub(r"\]\s*[\}\)]$", "])", line)
-    line = re.sub(r"\)\s*\]$", "])", line)
     line = re.sub(r"Action\(\[\s*@(\w+)\(([^)]*)\)\s*\)(?!\s*\])", r"Action([@\1(\2)])", line)
     line = re.sub(r"Col\(\s*([\"'][^\"']+[\"'])\s*\)", r"Col(\1, [])", line)
     line = re.sub(r'(=\s*Card\(\s*\[.*\])\s*,\s*["\'][^"\']*["\']\s*\)', r"\1)", line)
-    line = re.sub(r'(=\s*Table\(\s*\[.*\])\s*,.*?\)', r"\1)", line)
+    # Greedy .* so nested Col(label, [...]) does not stop at first ]
+    line = re.sub(r'(=\s*Table\(\s*\[.*\])\s*,.*\)', r"\1)", line)
     line = re.sub(r',\s*(["\'](?:primary|secondary|tertiary)["\'])\s*,\s*(["\'](?:small|default|large)["\'])\s*\)', r', \1, "normal", \2)', line)
+    # Size in type slot: Button(..., "large") -> Button(..., "normal", "large")
+    line = re.sub(r',\s*(["\'](?:small|large)["\'])\s*\)', r', "normal", \1)', line)
+    # BarChart sources as bare string -> wrap in array
+    line = re.sub(r'(BarChart\([^)]*,\s*)(["\'][^"\']+["\'])(\s*\))', r'\1[\2]\3', line)
     if line.endswith("}") and "{" not in line:
         line = line[:-1] + ("])" if "[" in line else ")")
     return line
@@ -317,15 +320,71 @@ def _repair_table_rows(code: str) -> str:
     return code[:m_table.start()] + new_table_line + code[m_table.end():]
 
 
+def _brackets_balanced(line: str) -> bool:
+    return all(line.count(open_ch) == line.count(close_ch) for open_ch, close_ch in ("()", "[]", "{}"))
+
+
+# Max positional args per chart type as defined by OpenUI Lang spec
+_CHART_MAX_ARGS: dict[str, int] = {
+    "BarChart": 6, "LineChart": 6, "AreaChart": 6, "HorizontalBarChart": 6,
+    "RadarChart": 5, "PieChart": 3, "RadialChart": 2,
+    "ScatterChart": 3, "SingleStackedBarChart": 3,
+}
+
+
+def _split_top_level_args(s: str) -> list[str]:
+    """Split comma-separated args respecting nested brackets."""
+    args: list[str] = []
+    depth, buf = 0, []
+    for ch in s:
+        if ch in "([{": depth += 1
+        elif ch in ")]}": depth -= 1
+        if ch == "," and depth == 0:
+            args.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        args.append("".join(buf).strip())
+    return args
+
+
+def _fix_chart_args(code: str) -> str:
+    # Truncate excess chart args and coerce string height values to numbers
+    for chart, max_args in _CHART_MAX_ARGS.items():
+        pat = re.compile(rf"\b{chart}\(")
+        pos, parts = 0, []
+        for m in pat.finditer(code):
+            parts.append(code[pos:m.end()])
+            depth, i = 1, m.end()
+            while i < len(code) and depth > 0:
+                if code[i] in "([{": depth += 1
+                elif code[i] in ")]}": depth -= 1
+                i += 1
+            args = _split_top_level_args(code[m.end():i - 1])[:max_args]
+            # Coerce string height (last optional arg) to int
+            if args:
+                m_h = re.match(r'^["\'](\.?\d+\.?\d*)(?:px|em|rem|vh|%)?["\']$', args[-1].strip())
+                if m_h:
+                    args[-1] = str(int(float(m_h.group(1))))
+            parts.append(", ".join(args) + ")")
+            pos = i
+        parts.append(code[pos:])
+        code = "".join(parts)
+    return code
+
+
 def _clean_openui_code(code: str) -> str:
     """Sanitizes small LLM formatting slips into valid OpenUI Lang syntax."""
     if not code:
         return code
     code = _repair_table_rows(code)
+    code = _fix_chart_args(code)
     cleaned_lines = []
     for raw in code.splitlines():
         line = raw.strip()
-        if not line or line.startswith(("#", "//")):
+        # Multi-line statements have unbalanced brackets per line; per-line fixes would corrupt them
+        if not line or line.startswith(("#", "//")) or not _brackets_balanced(line):
             cleaned_lines.append(raw)
             continue
         line = _clean_syntax_typos(line)
@@ -692,6 +751,7 @@ class Tools:
         - Table is strictly COLUMN-oriented: Table([Col("Col1", list1), Col("Col2", list2)]). NEVER use Row(...) or pass row data as a 2nd Table argument.
         - For feature highlights/grids, use ListBlock([ListItem("Title", "Subtitle"), ...]) or Table([Col("Feature", list1), Col("Description", list2)]).
         - Every name must be defined and reachable from root.
+        - CardHeader(title, subtitle) takes plain string literals only. NEVER pass a variable bound to TextContent, and NEVER use named arguments like title=.
         - Card is the only layout container. Do NOT use Stack.
         - Use FollowUpBlock at the END for next actions.
         - Carousel slides MUST all have the same structure.
@@ -712,11 +772,10 @@ class Tools:
             )
         openui_lang_code = _clean_openui_code(openui_lang_code)
         theme = await _get_openwebui_theme(__event_call__)
-        response = HTMLResponse(
-            content=_build_openui_html(openui_lang_code, title, self.valves.cdn_base_url, theme),
-            headers={"Content-Disposition": "inline"},
-        )
+        html = _build_openui_html(openui_lang_code, title, self.valves.cdn_base_url, theme)
+        # Emit the embed once; returning HTML as the tool result would render it a second time in the tool-call details
         if __event_emitter__:
+            await __event_emitter__({"type": "embeds", "data": {"embeds": [html]}})
             await __event_emitter__(
                 {
                     "type": "status",
@@ -733,4 +792,4 @@ class Tools:
             f"language. If the visualization has interactive elements (clickable items, "
             f"buttons, forms, follow-ups), mention what the user can interact with."
         )
-        return response, result_context
+        return result_context
